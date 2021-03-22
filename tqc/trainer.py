@@ -3,6 +3,7 @@ import torch
 from tqc.functions import quantile_huber_loss_f
 from tqc import DEVICE
 
+###debug
 
 class Trainer(object):
 	def __init__(
@@ -15,11 +16,15 @@ class Trainer(object):
 		tau,
 		top_quantiles_to_drop,
 		target_entropy,
+		n_nets,
+		beta,
+		n_quantiles,
 	):
 		self.actor = actor
 		self.critic = critic
 		self.critic_target = critic_target
 		self.log_alpha = torch.zeros((1,), requires_grad=True, device=DEVICE)
+		self.n_nets = n_nets
 
 		# TODO: check hyperparams
 		self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
@@ -30,10 +35,29 @@ class Trainer(object):
 		self.tau = tau
 		self.top_quantiles_to_drop = top_quantiles_to_drop
 		self.target_entropy = target_entropy
+		self.beta = beta
+		self.n_quantiles = n_quantiles
 
 		self.quantiles_total = critic.n_quantiles * critic.n_nets
 
 		self.total_it = 0
+
+
+	def select_critic(self, q, num):
+		q_var = q.var(2)
+		q_mean = q.mean(2)
+		a = q_var.argmin(1).reshape(256,-1)
+		#a = a.reshape(256, -1)
+		b = q_mean.argmin(1).reshape(256,-1)
+		#b = b.reshape(256, -1)
+		d = torch.cat((a, b), 1)
+		g = d.reshape(512,1)
+		c = q_mean.var(1)
+		c = (c > self.beta).long()
+		d = d.reshape(512, 1)[torch.arange(256).cuda() * 2 + c]
+		d = d.squeeze()
+		target = q.reshape(-1, num)[torch.arange(256).cuda() * self.n_nets + d]
+		return target
 
 	def train(self, replay_buffer, batch_size=256):
 		state, action, next_state, reward, not_done = replay_buffer.sample(batch_size)
@@ -46,8 +70,7 @@ class Trainer(object):
 
 			# compute and cut quantiles at the next state
 			next_z = self.critic_target(next_state, new_next_action)  # batch x nets x quantiles
-			sorted_z, _ = torch.sort(next_z.reshape(batch_size, -1))
-			sorted_z_part = sorted_z[:, :self.quantiles_total-self.top_quantiles_to_drop]
+			next_z = self.select_critic(next_z, self.n_quantiles)
 
 			# compute target
 			target = reward + not_done * self.discount * (sorted_z_part - alpha * next_log_pi)
